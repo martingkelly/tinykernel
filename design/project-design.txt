@@ -1,0 +1,299 @@
+Tiny Kernel (TK) design:
+
+Overall, I designed my Tiny Kernel with the following goals in mind:
+- Good test coverage.
+- Simplistic design (in the good sense) so that debugging is easy. Reject
+  overengineering and overdesign.
+- Make the API as simple as possible so the user doesn't have to worry about OS
+  internal details. Keep complications inside the OS internals and don't let
+  them leak into the overall design or API.
+- Reasonably fast, although speed was not a main design goal.
+
+Code structure:
+- Overall, the code is structured as follows:
+  * src: All the .c and .s files live here.
+    * src/test: All test code lives here.
+    * src/drivers: All drivers live here, although the overall device driver
+                   framework (DDF) does not. In this way, we keep driver design
+                   details out of the DDF, and we can test and prove out the DDF
+                   separate from the individual drivers.
+  * include: All the .h files live here. Note that every .c file has a matching
+             .h file. In addition, every header has an include guard and is
+             self-contained, so order of inclusion doesn't matter and you need
+             to include only one file to get a given function.
+- In addition, within both src/ and include/, we have:
+  * tk: OS code lives here.
+  * lpc: Hardware-dependent code lives here.
+  I tried to keep the OS and hardware code separate so that (1) TK doesn't take
+  accidental dependencies on the hardware and (2) Porting to another board would
+  be easy(ish). One place in which this breaks down a little bit is drivers,
+  which are necessarily hardware-dependent. I could spend more time to expose
+  some abstractions so that the drivers could be less hardware-dependent, but
+  given that different hardware will lend itself towards different designs and
+  APIs (e.g. polling vs. interrupt-driven), this feels like overengineering at
+  this point. Once I needed to port TK to another board, I would evaluate this
+  in greater detail.
+- One notable piece of the code is the presence of "_" versions of normal
+  functions. For example, there are two scheduling functions:
+    void TKSchedule(void);
+    struct TKThread * _TKSchedule(struct TKThreadQueue * runQueue,
+                                  struct TKThreadQueue * sleepQueue,
+                                  TKTickCount tickCount);
+  The "_" version of the functions receives all the data needed to execute the
+  function via arguments. The normal version calls the "_" version with default
+  global versions of the data.
+  The purpose of this split is to achieve two somewhat conflicting goals:
+  (1) Keep the API both within TK and for the user as simple as possible. Thus
+      the user and TK would call TKSchedule() directly.
+  (2) Make functions unit testable with no dependencies on external data. By
+      calling the "_" versions of the functions, the unit tests can supply their
+      own test data without having to worry about the overall TK kernel state.
+      For example, to test sleep functionality, it can make a thread sleep for
+      1000 ticks and then manually pass in both 999 and 1000 for tickCount
+      inside of _TKSchedule to see if the thread gets scheduled in those two
+      cases.
+- All memory is statically fixed at compile time. There is no memory allocation,
+  so once the OS is started, everything just uses references to existing memory.
+  This keeps things simple and prevents issues like memory leaks. Given how
+  small TK is, I think memory allocation is totally unneeded for achieving its
+  goals.
+
+Tests:
+- I used two categories of testing:
+  * Self-contained unit tests with as little state as possible. Whenever
+    possible, I tested code using these. When writing tests, I tried to cover
+    all possible error codes as well as a few normal happy cases. Because of how
+    software works, there are of course far more error tests than happy case
+    tests. That's probably good, as error paths are often poorly tested in real
+    software.
+  * An integration test: several threads running at full speed within the real
+    OS, with instrumentation regularly output. Although there are no assertions
+    in these tests, it's easy to inspect the output and determine if TK is
+    running correctly. For example, if the instrumentation data shows a large
+    slowdown or if the producer/consumer counts deviate, something is probably
+    wrong.
+- One notable unit test coverage gap is context switching. I had a lot of
+  trouble coming up with meaningful unit tests for context switches because once
+  you switch context, you have lost your test context. I thought of some hacky
+  ways to get back to the test after switching away from it (e.g. manually
+  manipulating the LR register), but they all felt inelegant and error-prone to
+  me. My eventual solution to this was just to rely on the integration tests to
+  validate context switching, as well as manually varying the timer frequency
+  and making sure everything was still OK. In some cases, doing this exposed
+  subtle race conditions in my code.
+
+Scheduling:
+- I tried to make my scheduler as simple as possible, as well as make it
+  reasonably fast. In order to achieve these goals, I did the following:
+  * Two queues for threads: the run queue and the sleep queue. The run queue
+    contains only threads that are currently runnable, while the sleep queue
+    contains threads that are waiting on the timer tick. By separating these
+    queues, the scheduler's task becomes simpler because it doesn't have to
+    think about thread states. Specifically the scheduler pseudocode looks like
+    this:
+      - Check if any threads in the sleep queue are ready to wake. If so, move
+        them from the sleep to the run queue.
+      - Iterate through the run queue and find the highest priority thread. Run
+        that one.
+- I could have optimized this further to get O(1) scheduling rather than
+  O(n, n = queue length). For example, I could have used fancier data structures
+  for implementing the sleep queues in order to achieve O(1) sleep queue checks
+  (e.g. using the Linux scheduler method). I also could have made the run queue
+  iteration O(1) by putting each thread priority in a separate run queue. In
+  that way, the scheduler could just check a bitmap to determine the highest
+  priority runnable thread and then pop the thread of the appropriate run queue.
+
+  I chose not to optimize for a few reasons:
+  * TK was fast enough for my purposes.
+  * The number of threads running (4) is so low that this optimization likely
+    wouldn't buy me much. In addition, the optimization would likely use more
+    memory, which is somewhat scarce.
+- I implemented the queues within the thread objects themselves, via prev and
+  next pointers:
+  struct TKThread {
+      ...
+      struct TKThread * prev;
+      struct TKThread * next;
+  };
+  struct TKThreadQueue {
+      struct TKThread * head;
+  };
+  This simplification was possible because each thread can be in exactly one
+  thread at a time. Prior to this simplification, my thread queue code was ugly
+  because I needed matching thread queue and thread objects. This meant that
+  thread queue initialization and handling the memory for thread queues was
+  painful. Once I thought of this simplification, the logic became much simpler,
+  and thread queues were easy to manage, as they are really just a single
+  pointer.
+
+  This simplification taught me an important lesson, which continually gets
+  reinforced the more software I write: Always pick the simplest solution that
+  could possibly get the job done. Add complexity only when the simpler solution
+  has proven itself not to work. Given that TK is a small embedded system, this
+  thread solution works quite nicely.
+
+Device drivers:
+- The device driver framework (DDF) is designed to handle as much as it possibly
+  can so that the driver code required is as minimal as possible. This means
+  that the DDF does all parameter validation possible prior to calling the
+  driver-specific code. Here are two examples of this:
+  * ioctl: In other OSes, I've seen ioctls and similar operations reimplementing
+    parameter validation on a per-driver basis, and it leads to a ton of code
+    overhead and potential for error. By structuring the iocls in the right way,
+    the DDF can have enough information to validate ioctl parameters itself. The
+    driver can then assume that parameters are OK and focus on its
+    device-specific work.
+  * power states: The DDF tracks the power state (currently just on/off) of the
+    device and does sanity checking prior to asking the driver to change power
+    state. Thus if you ask the device to power down twice, in a row, the second
+    powerDown call will get an error from the DDF. By making the DDF handle
+    this, the device can assume that the requested transition is valid and not
+    have to check a bunch of error cases.
+- The DDF uses a few data structures:
+  * The device driver itself. This struct gets populated by each device driver
+    and contains device-specific details.
+  struct TKDriver {
+        char name[TK_MAX_DRIVER_NAME_LENGTH + 1];
+        uint32_t major;
+        uint32_t minor;
+        TKPowerState powerstate;
+        struct TKDriverOps ops;
+    };
+  * The device driver operations. These functions implement the core device
+    driver functionality and get called by the DDF rather than directly by the
+    user. The reason for splitting these out separate from the main device
+    driver calls (e.g. the read op vs. TKDriverRead) is so that the DDF can do
+    validation and sanity checking prior to calling the device driver op
+    function.
+    struct TKDriverOps {
+        void (*init)(void);
+        void (*open)(void);
+        void (*close)(void);
+        int (*read)(TKStatus * status, uint8_t * buffer, uint32_t size);
+        int (*write)(TKStatus * status, const uint8_t * buffer, uint32_t size);
+        struct TKIoctlInfo * (*ioctlInfo)(uint32_t code);
+        TKStatus (*powerUp)(void);
+        TKStatus (*powerDown)(void);
+    };
+  * Device driver entries. These are entries in the device driver table. They
+    are used so the DDF can track open/close status and control access to the
+    drivers. The semaphore has a count of 1 and is used to make sure each device
+    driver access is serialized. In addition, the semaphore wil put the calling
+    thread to sleep if it can't get access to the device, which is more
+    efficient than a busy-loop (e.g. the critical section).
+  struct TKDriverEntry {
+        struct TKDriver * driver;
+        struct TKSemaphore sem;
+        bool used;
+    };
+- The DDF flow is illustrated in a diagram.
+- Aside from the DDF itself, I implemented two device drivers:
+  * The test driver. This driver has no hardware dependencies and is used for
+    unit tests of the DDF. Most of its operations are no-ops, except for read
+    and write, which do a simple memcpy to/from a static driver buffer.
+  * A serial uart driver. This driver eventually wraps writes and reads to the
+    uart for output. It has a few interesting operations:
+    - write: wraps PUTC, which writes a byte to the uart and shows up through
+      minicom.
+    - read: wraps GETC, which reads a byte from the uart. This function can't
+      easily be called in an automated way because minicom doesn't actually
+      write anything to the serial port. However, I have tested that it works by
+      echoing values to /dev/ttyUSB0 (the device used by minicom on my Linux
+      machine). Go Unix!
+    - ioctl: changes the baud rate, the data bits, the stop bits, and the
+      parity.
+    - powerUp: Turns on the right bit to power on the UART.
+    - powerDown: Turns off the right bit to power off the UART.
+    Because of its hardware interactions, the serial uart driver is hard to unit
+    test in an automated way. Thus I decided to keep the unit testing parts in
+    the test driver and to prove out the serial driver by using it in the
+    integration tests. To prove it out, I did the following:
+    - Changed every print call within TK to use the device driver.
+    - Explicitly called the ioctl to change the baud rate and other serial port
+      parameters to the parameters I expect. Thus if I'm doing something
+      horribly wrong, the serial port likely won't show output.
+    - Try to stress my code by overflowing my buffers with writes/reads.
+    - Change the baud rate and other parameters via ioctl. Then make minicom use
+      the same settings, and verify that output still shows up correctly.
+    - Try powering up and down the uart and verify that output does/does not
+      come through. In addition, verify that powering down then up does not
+      break the uart.
+
+Interesting bugs I faced:
+- I had a subtle race condition that triggered when the timer was set to 2000 Hz
+  but not when it was set to 500 Hz or 5000 Hz. When the bug hit, the threads
+  deadlocked. The timing had to be just right to hit this bug. Given that the
+  bug changed characteristics when I adjusted the timer tick, I figured the
+  issue had to be with context switching.  After manually verifying context
+  switching and thread queue management code to be OK, I eventually zeroed in on
+  the thread sleep implementation. Specfically, I had a code snippet like this:
+  sleep:
+    - Enter a critical section
+    - Remove this thread from the run queue
+    - Add this thread to the sleep queue
+    - Leave the critical section
+    - Yield into the scheduler
+  I managed to break into the debugger when the deadlock had occurred and
+  noticed the following:
+  * The sleep critical section was held
+  * The thread holding the critical section was sleeping
+  I wondered if I had forgotten to leave the critical section, but I didn't see
+  an instance of that. Finally I realized that the following sequence of events
+  could trigger a deadlock:
+    - Enter the critical section
+    - Remove thread from the run queue
+    - Timer interrupt, context switched out
+  Given this sequence, the critical section would be held but the thread would
+  be removed from the run queue and never get scheduled again. I managed to
+  repro this in my threads by having the threads yield at appropriate times. The
+  solution was to disable interrupts prior to removeng the thread from the run
+  queue, and reenable them afterwards.
+- I tried to validate the thread scheduling instrumentation with the debugger. I
+  started getting crazy-high numbers (e.g. several seconds per context switch)
+  that were very different from what I observed without the debugger. I
+  carefully checked my instrumentation math and found no issues. Eventually, I
+  realized that  the physical time spent at the breakpoint was counting against
+  me. It was very funny when I finally figured it out.
+- Using the serial driver at first broke my thread scheduling instrumentation.
+  - I saw the same min but crazy-high averages and max times.
+  - This is because I disabled interrupts in between calls to the driver, in
+    order to get non-blocking behavior.
+  - Since this happened at every print to the serial port, it became a pretty
+    big deal.
+  - Instead of disabling interrupts as the assignment said to do, I used a
+    semaphore.
+  - Timing went back to normal.
+
+How I convinced myself that Tiny Kernel was performant:
+- I added generic instrumentation functionality to the kernel and then used it
+  to profile the scheduler.
+- I verified that the timing looked sane. To do this, I did a few tests:
+  1)
+    * Set the board to print a message and infinite loop when we hit a certain
+      tick count of known duration. Set a stopwatch on my cellphone for that
+      duration and verified that the two were within a second of each other (my
+      likely reaction time, plus some context switching overhead).
+  2)
+    * Printed out the time every time we hit an interrupt
+    * Needed to find the PCLK frequency to determine units when I read the timer
+      counter. The LPC code claims the PCLK frequency is 48MHz. I wanted to
+      verify that the LPC code was correct. The first thing I did was to clear
+      the match register bit so the timer wouldn't reset when the match
+      triggered. That way I could see the timer counter monotically increasing.
+      I calculated that at 48 MHz, the counter would take about 89 seconds to
+      overflow a 32-bit value. Since this wasn't too long to wait, I waited with
+      a stopwatch. When I got a value of almost exactly 89 seconds, I believed
+      the LPC code.
+    * Since PCLK frequency is 48MHz, I could divide the difference between
+      interrupts by (48*1000) to get the difference in ms.
+- I compared my instrumentation to the theoretical numbers I should be getting
+  and verified that the two were close together. Specifically, I compared my
+  measured result (~0.43% scheduling overhead) to the theoretical result given
+  that my scheduler is measured at an average of 8 us. The theoretical result
+  gave 8 * 500 / 1000000 = 0.40%. Given that we're rounding to the nearest tick
+  and that we disable interrupts at various points (causing the ticks to stop
+  monotically increasing), this seems close enough that I'm guessing my
+  measurements are correct.
+
+  I also tried turning optimization level to O3. With that, I get 3 us
+  scheduling and 0.18% overhead, with a theoretical overhead of 0.15%. Nice!
